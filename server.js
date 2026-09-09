@@ -273,10 +273,17 @@ const instanceMemoryBytes = new Map();
 
 async function refreshTabCounts(instances) {
   const runningIds = new Set();
+
+  // One async `ps` + `lsof` for the whole fleet. This used to be a synchronous
+  // pair of shell-outs per instance, which stalled the event loop on every tab
+  // open/close and every sync tick — long enough for the health probe's timer
+  // to fire against a live port and get the instance killed.
+  const memoryByInstance = await chromeManager.getInstancesMemoryBytes(instances);
+
   await Promise.all(instances.map(async (instance) => {
     if (instance.status !== 'running') return;
     runningIds.add(instance.id);
-    instanceMemoryBytes.set(instance.id, chromeManager.getInstanceMemoryBytes(instance));
+    instanceMemoryBytes.set(instance.id, memoryByInstance.get(instance.id) ?? null);
     try {
       const tabs = await cdpClient.getTabs(instance.host, instance.port);
       const count = Array.isArray(tabs)
@@ -758,10 +765,12 @@ async function handleNavigateTab(req, res) {
 
 async function handleDeleteTab(req, res) {
   const instance = getInstanceByIdOrThrow(req.params.id);
-  await cdpClient.closeTab(instance.host, instance.port, req.params.tabId);
+  // closeTab keeps the browser alive when this is the last page target by
+  // opening a replacement first; hand that tab back so the caller can focus it.
+  const { replacement } = await cdpClient.closeTab(instance.host, instance.port, req.params.tabId);
   await refreshTabCounts([instance]);
   broadcastUpdate();
-  res.json({ success: true });
+  res.json({ success: true, replacement: replacement || null });
 }
 
 async function handleScreenshot(req, res) {

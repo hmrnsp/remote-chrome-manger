@@ -466,6 +466,92 @@ function getActions(inst, small = false) {
     `;
 }
 
+// --- Reusable confirmation modal -----------------------------------------
+// Stopping an instance tears down a live browser and every tab in it, so it
+// must never be one stray click away. Resolves true only if the user confirms;
+// dismissing the modal any other way (Cancel, backdrop, Esc, the X) resolves
+// false. Falls back to the native confirm() if Bootstrap or the markup is
+// missing, so an action can never silently proceed unconfirmed.
+let confirmModalInstance = null;
+let confirmModalGeneration = 0;
+
+// Bootstrap's hide() is a no-op while the show transition is still running, so
+// a confirm click that lands inside that window would leave the dialog open
+// *and* never resolve — a safety prompt that silently swallows the action.
+// Retry briefly until the modal is actually gone; the generation token stops a
+// stale retry from closing a dialog that has since been reopened.
+function hideConfirmModal(generation, attempt = 0) {
+    if (!confirmModalInstance || generation !== confirmModalGeneration) return;
+    confirmModalInstance.hide();
+    const el = document.getElementById('confirmModal');
+    if (attempt < 20 && el && el.classList.contains('show')) {
+        setTimeout(() => hideConfirmModal(generation, attempt + 1), 50);
+    }
+}
+
+function confirmAction(options = {}) {
+    const {
+        title = 'Are you sure?',
+        messageHtml = '',
+        detailHtml = '',
+        confirmLabel = 'Confirm',
+        confirmClass = 'btn-danger',
+        icon = 'bi-exclamation-triangle-fill text-warning',
+    } = options;
+
+    const el = document.getElementById('confirmModal');
+    if (!el || typeof bootstrap === 'undefined') {
+        const plain = String(messageHtml).replace(/<[^>]*>/g, '');
+        return Promise.resolve(window.confirm(`${title}\n\n${plain}`));
+    }
+
+    document.getElementById('confirmModalTitle').innerText = title;
+    document.getElementById('confirmModalMessage').innerHTML = messageHtml;
+    document.getElementById('confirmModalIcon').className = `bi ${icon} me-2`;
+
+    const detail = document.getElementById('confirmModalDetail');
+    detail.innerHTML = detailHtml;
+    detail.classList.toggle('d-none', !detailHtml);
+
+    const btn = document.getElementById('confirmModalConfirmBtn');
+    btn.className = `btn ${confirmClass} px-4`;
+    btn.innerText = confirmLabel;
+
+    if (!confirmModalInstance) confirmModalInstance = new bootstrap.Modal(el);
+    const generation = ++confirmModalGeneration;
+
+    return new Promise((resolve) => {
+        let settled = false;
+        // Resolve on the click itself rather than on hidden.bs.modal: the
+        // outcome must not depend on the dialog finishing its animation.
+        const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            btn.removeEventListener('click', onConfirm);
+            el.removeEventListener('hidden.bs.modal', onDismiss);
+            resolve(value);
+        };
+        const onConfirm = () => { finish(true); hideConfirmModal(generation); };
+        const onDismiss = () => finish(false);
+
+        btn.addEventListener('click', onConfirm);
+        el.addEventListener('hidden.bs.modal', onDismiss);
+        confirmModalInstance.show();
+    });
+}
+
+// Render label/value pairs into the modal's detail panel.
+function confirmDetailRows(rows) {
+    return rows
+        .filter(([, value]) => value !== null && value !== undefined && value !== '')
+        .map(([label, value]) => `
+            <div class="d-flex justify-content-between gap-3 py-1">
+                <span class="text-theme-muted">${escapeHtml(label)}</span>
+                <span class="fw-bold text-end">${escapeHtml(value)}</span>
+            </div>`)
+        .join('');
+}
+
 // --- Instance Actions ---
 async function startInstance(id) {
     try {
@@ -475,6 +561,32 @@ async function startInstance(id) {
     }
 }
 async function stopInstance(id) {
+    // Read the instance fresh rather than trusting the cached list: tab_count
+    // and memory_bytes are filled in by the periodic sync, so a card opened
+    // shortly after start would show the dialog without the very numbers that
+    // make it worth reading. Fall back to the cache if the request fails.
+    let inst = null;
+    try { inst = await fetchAPI(`/api/instances/${id}`); } catch { /* fall back below */ }
+    if (!inst || !inst.id) inst = allInstances.find(item => item.id === id) || null;
+
+    const name = inst ? inst.name : `#${id}`;
+    const tabs = inst && typeof inst.tab_count === 'number' ? inst.tab_count : null;
+
+    const confirmed = await confirmAction({
+        title: 'Stop instance?',
+        messageHtml: `<b>${escapeHtml(name)}</b> will be shut down. Chrome and every tab it has open are closed.`
+            + ' The profile on disk is kept, but anything in flight — uploads, unsaved form input — is lost.',
+        detailHtml: confirmDetailRows([
+            ['Endpoint', inst ? `${inst.host}:${inst.port}` : null],
+            ['Mode', inst ? (inst.launch_mode_label || inst.launch_mode) : null],
+            ['Open tabs', tabs === null ? null : `${tabs} tab${tabs === 1 ? '' : 's'} will be closed`],
+            ['Memory', inst && typeof inst.memory_bytes === 'number' ? formatBytes(inst.memory_bytes) : null],
+            ['Uptime', inst && inst.started_at ? formatUptimeFrom(inst.started_at) : null],
+        ]),
+        confirmLabel: 'Stop instance',
+    });
+    if (!confirmed) return;
+
     try {
         await fetchJsonOrThrow(`/api/instances/${id}/stop`, { method: 'POST' });
     } catch (e) {
@@ -515,10 +627,35 @@ if (btnStartAll) {
 }
 
 if (btnStopAll) {
-    btnStopAll.addEventListener('click', () => {
-        const targets = getFilteredInstances(allInstances).filter(i => i.status !== 'stopped');
+    btnStopAll.addEventListener('click', async () => {
+        // Same reason as stopInstance: one fresh list so the tab total shown is
+        // the real one. /api/instances is a single request for the whole fleet.
+        let fleet = allInstances;
+        try {
+            const fresh = await fetchAPI('/api/instances');
+            if (Array.isArray(fresh) && fresh.length) fleet = fresh;
+        } catch { /* fall back to the cached list */ }
+
+        const targets = getFilteredInstances(fleet).filter(i => i.status !== 'stopped');
         if (!targets.length) { alert('No running instances to stop.'); return; }
-        if (!confirm(`Stop ${targets.length} instance(s)?`)) return;
+
+        const totalTabs = targets.reduce((sum, i) => sum + (typeof i.tab_count === 'number' ? i.tab_count : 0), 0);
+        // Name every instance that is about to go down — "Stop all" acts on the
+        // current search filter, so the set is not always what's on screen.
+        const list = targets.map(i => `
+            <div class="d-flex justify-content-between gap-3 py-1">
+                <span class="fw-bold">${escapeHtml(i.name)}</span>
+                <span class="text-theme-muted">${escapeHtml(`${i.host}:${i.port}`)}</span>
+            </div>`).join('');
+
+        const confirmed = await confirmAction({
+            title: `Stop ${targets.length} instance${targets.length === 1 ? '' : 's'}?`,
+            messageHtml: `Every instance listed below is shut down, closing <b>${totalTabs}</b> open tab${totalTabs === 1 ? '' : 's'} in total.`,
+            detailHtml: list,
+            confirmLabel: `Stop ${targets.length} instance${targets.length === 1 ? '' : 's'}`,
+        });
+        if (!confirmed) return;
+
         bulkAction(targets, 'stop', 'Stopping', btnStopAll);
     });
 }
@@ -914,9 +1051,14 @@ document.getElementById('btnCloseTab').addEventListener('click', async () => {
     noTabSelected.classList.remove('d-none');
     tabScreenshot.removeAttribute('src');
     setStreamStatus('idle');
-    await fetchAPI(`/api/instances/${currentInstanceId}/tabs/${closingId}`, 'DELETE');
+    // The server refuses to leave the browser with zero tabs — closing the last
+    // one kills the instance in gui/xvfb mode — so it hands back the blank tab
+    // it opened in its place. Focus that instead of falling back to tab 0.
+    const res = await fetchAPI(`/api/instances/${currentInstanceId}/tabs/${closingId}`, 'DELETE');
     await loadTabs();
-    if (currentTabs.length) selectTab(currentTabs[0].id);
+    const replacementId = res && res.replacement && res.replacement.id;
+    if (replacementId && currentTabs.some(t => t.id === replacementId)) selectTab(replacementId);
+    else if (currentTabs.length) selectTab(currentTabs[0].id);
 });
 
 // --- Input helpers ---
